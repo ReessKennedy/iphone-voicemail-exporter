@@ -340,12 +340,12 @@ class TestMakeOutputFilename:
             "sender": "+15551234567",
         }
         name = ve.make_output_filename(entry, 1)
-        assert name == "001_2024-03-15_+15551234567.amr"
+        assert name == "2024-03-15-1022_+15551234567.amr"
 
     def test_unknown_sender(self):
         entry = {"date_str": "", "sender": None, "callback_num": None}
         name = ve.make_output_filename(entry, 3, fmt="mp3")
-        assert name.startswith("003_")
+        assert name.startswith("unknown-date_")
         assert name.endswith(".mp3")
         assert "unknown" in name
 

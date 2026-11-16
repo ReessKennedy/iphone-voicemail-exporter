@@ -180,7 +180,10 @@ def open_manifest_db(backup_path, password=None):
     if not manifest_db.exists():
         print(f"Error: Manifest.db not found in {backup_path}", file=sys.stderr)
         sys.exit(1)
-    conn = sqlite3.connect(str(manifest_db))
+    # Backups are source data only.  Opening immutable avoids SQLite trying to
+    # create journal/lock files beside Manifest.db, which can fail on external
+    # or read-only backup volumes.
+    conn = sqlite3.connect(f"file:{manifest_db}?mode=ro&immutable=1", uri=True)
     return conn, None, None
 
 
@@ -332,23 +335,40 @@ def match_voicemails(audio_files, metadata):
 
 
 def make_output_filename(entry, index, fmt="amr"):
-    """Generate a human-readable output filename for a voicemail."""
-    date_part = ""
+    """Generate a timestamped, human-readable output filename for a voicemail."""
+    timestamp_part = "unknown-date"
     date_str = entry.get("date_str", "")
     if date_str:
-        # e.g. "2024-03-15 10:22:00 UTC" -> "2024-03-15"
-        date_part = date_str.split(" ")[0]
+        try:
+            # e.g. "2024-03-15 10:22:00 UTC" -> "2024-03-15-1022"
+            timestamp_part = datetime.strptime(
+                date_str, "%Y-%m-%d %H:%M:%S UTC"
+            ).strftime("%Y-%m-%d-%H%M")
+        except ValueError:
+            # Retain a usable date if a future iOS version omits the time.
+            timestamp_part = date_str.split(" ")[0] or timestamp_part
 
     sender = entry.get("sender") or entry.get("callback_num") or "unknown"
     # Sanitize: keep only alphanumerics, dashes, underscores, plus
     safe_sender = "".join(c if c.isalnum() or c in "-_+" else "_" for c in sender)
     safe_sender = safe_sender.strip("_")[:40] or "unknown"
 
-    parts = [f"{index:03d}"]
-    if date_part:
-        parts.append(date_part)
-    parts.append(safe_sender)
-    return "_".join(parts) + f".{fmt}"
+    return f"{timestamp_part}_{safe_sender}.{fmt}"
+
+
+def unique_output_path(path):
+    """Return a path that will not overwrite an existing export."""
+    if not path.exists():
+        return path
+
+    for duplicate_num in range(2, 10_000):
+        candidate = path.with_name(
+            f"{path.stem}_{duplicate_num:03d}{path.suffix}"
+        )
+        if not candidate.exists():
+            return candidate
+
+    raise RuntimeError(f"Could not find an available output filename for {path.name}")
 
 
 def convert_audio(src_path, dest_path, fmt):
@@ -401,7 +421,8 @@ def export_voicemails(matched, output_dir, backup_path, convert_format=None,
 
         out_fmt = convert_format or "amr"
         out_name = make_output_filename(entry, i, fmt=out_fmt)
-        out_path = output_dir / out_name
+        out_path = unique_output_path(output_dir / out_name)
+        out_name = out_path.name
 
         if convert_format:
             # Extract to temp first, then convert
@@ -412,7 +433,7 @@ def export_voicemails(matched, output_dir, backup_path, convert_format=None,
                 ok = convert_audio(tmp_path, out_path, convert_format)
                 if not ok:
                     # Fall back to copying .amr
-                    fallback = out_path.with_suffix(".amr")
+                    fallback = unique_output_path(out_path.with_suffix(".amr"))
                     shutil.copy2(str(tmp_path), str(fallback))
                     entry["output_file"] = fallback.name
                 else:
@@ -421,8 +442,6 @@ def export_voicemails(matched, output_dir, backup_path, convert_format=None,
                 entry["output_file"] = ""
             tmp_path.unlink(missing_ok=True)
         else:
-            out_name = make_output_filename(entry, i, fmt="amr")
-            out_path = output_dir / out_name
             success = extract_file(backup_path, file_id, out_path, encrypted_backup)
             entry["output_file"] = out_name if success else ""
 
