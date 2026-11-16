@@ -7,6 +7,7 @@ Export voicemails from iPhone local backups (iTunes/Finder) to labeled audio fil
 - Works with **unencrypted backups** using zero extra dependencies (stdlib only)
 - Works with **encrypted backups** via `iphone-backup-decrypt`
 - Exports `.amr` files with human-readable names: `2024-03-15-1022_+15551234567.amr`
+- Preserves each voicemail's timestamp as the exported file's modification time (and creation time on macOS)
 - Converts to **MP3, WAV, or M4A** via ffmpeg
 - Generates a **`voicemails.csv`** manifest with sender, date, duration, and more
 - Auto-detects backup location on macOS, Windows, and Linux

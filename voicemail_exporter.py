@@ -190,7 +190,7 @@ def open_manifest_db(backup_path, password=None):
 def find_voicemail_files(manifest_conn):
     """Query Manifest.db for voicemail audio files.
 
-    Returns list of dicts: {file_id, relative_path, filename}.
+    Returns list of dicts: {file_id, relative_path, voicemail_folder, filename}.
     """
     cursor = manifest_conn.cursor()
     cursor.execute(
@@ -207,30 +207,29 @@ def find_voicemail_files(manifest_conn):
         results.append({
             "file_id": file_id,
             "relative_path": rel_path,
+            "voicemail_folder": str(Path(rel_path).parent),
             "filename": Path(rel_path).stem,  # e.g. "1" from "1.amr"
         })
     return results
 
 
-def find_voicemail_db(manifest_conn):
-    """Query Manifest.db for the voicemail.db file entry.
-
-    Returns (file_id, relative_path) or (None, None).
-    """
+def find_voicemail_databases(manifest_conn):
+    """Find primary and account-specific voicemail database entries."""
     cursor = manifest_conn.cursor()
     cursor.execute(
         """
         SELECT fileID, relativePath
         FROM Files
         WHERE domain = 'HomeDomain'
-          AND relativePath = 'Library/Voicemail/voicemail.db'
-        LIMIT 1
+          AND (
+              relativePath = 'Library/Voicemail/voicemail.db'
+              OR relativePath LIKE 'Library/Voicemail/A-%/voicemail.db'
+          )
+        ORDER BY CASE WHEN relativePath = 'Library/Voicemail/voicemail.db'
+                      THEN 0 ELSE 1 END, relativePath
         """
     )
-    row = cursor.fetchone()
-    if row:
-        return row[0], row[1]
-    return None, None
+    return cursor.fetchall()
 
 
 def extract_file(backup_path, file_id, dest_path, encrypted_backup=None):
@@ -251,39 +250,58 @@ def extract_file(backup_path, file_id, dest_path, encrypted_backup=None):
     return True
 
 
-def convert_timestamp(ts):
-    """Convert a numeric timestamp to a UTC datetime string.
-
-    Detects Unix epoch vs Core Data epoch automatically.
-    Returns ISO-format string or empty string on failure.
-    """
+def voicemail_unix_timestamp(ts):
+    """Return a voicemail timestamp as Unix seconds, or ``None`` on failure."""
     if ts is None:
-        return ""
+        return None
     try:
         ts = float(ts)
         if ts <= 0:
-            return ""
+            return None
         if ts < UNIX_THRESHOLD:
             # Core Data epoch (seconds since 2001-01-01)
             ts += CORE_DATA_EPOCH_OFFSET
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
     except (ValueError, OSError, OverflowError):
+        return None
+    return ts
+
+
+def convert_timestamp(ts):
+    """Convert a numeric timestamp to a UTC datetime string."""
+    unix_timestamp = voicemail_unix_timestamp(ts)
+    if unix_timestamp is None:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(unix_timestamp, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (OSError, OverflowError):
         return ""
 
 
-def parse_voicemail_metadata(voicemail_db_path):
-    """Read voicemail table from voicemail.db.
+def parse_voicemail_metadata(voicemail_db_path, table="voicemail",
+                             voicemail_folder="", include_without_audio=False,
+                             allow_cross_folder_match=False):
+    """Read voicemail metadata from one table in a voicemail database.
 
     Returns list of dicts with keys: rowid, sender, date_str, duration,
     callback_num, label.
     """
+    if table not in {"voicemail", "deleted"}:
+        raise ValueError(f"Unsupported voicemail metadata table: {table}")
+
     conn = sqlite3.connect(str(voicemail_db_path))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
+    table_exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    if not table_exists:
+        conn.close()
+        return []
+
     # Discover columns (schema varies across iOS versions)
-    cursor.execute("PRAGMA table_info(voicemail)")
+    cursor.execute(f"PRAGMA table_info({table})")
     columns = {row["name"] for row in cursor.fetchall()}
 
     # Build a safe SELECT based on available columns
@@ -293,13 +311,16 @@ def parse_voicemail_metadata(voicemail_db_path):
         if col in columns:
             select_cols.append(col)
 
-    cursor.execute(f"SELECT {', '.join(select_cols)} FROM voicemail ORDER BY ROWID")
+    cursor.execute(f"SELECT {', '.join(select_cols)} FROM {table} ORDER BY ROWID")
 
     results = []
     for row in cursor.fetchall():
         entry = dict(row)
         entry["rowid"] = entry.pop("ROWID")
         entry["date_str"] = convert_timestamp(entry.get("date"))
+        entry["voicemail_folder"] = voicemail_folder
+        entry["_include_without_audio"] = include_without_audio
+        entry["_allow_cross_folder_match"] = allow_cross_folder_match
         results.append(entry)
 
     conn.close()
@@ -307,24 +328,46 @@ def parse_voicemail_metadata(voicemail_db_path):
 
 
 def match_voicemails(audio_files, metadata):
-    """Join audio files with metadata by ROWID / filename.
+    """Join audio files with metadata by voicemail folder and ROWID / filename.
 
     iPhone voicemail audio files are named after their ROWID (e.g., "1.amr").
     Returns list of dicts combining both sources.
     """
-    meta_by_rowid = {str(m["rowid"]): m for m in metadata}
+    meta_by_key = {}
+    cross_folder_deleted_by_rowid = {}
+    for metadata_entry in metadata:
+        key = (
+            metadata_entry.get("voicemail_folder", ""),
+            str(metadata_entry["rowid"]),
+        )
+        # Prefer a current voicemail record if it shares an ID with a deleted one.
+        meta_by_key.setdefault(key, metadata_entry)
+        if metadata_entry.get("_allow_cross_folder_match"):
+            cross_folder_deleted_by_rowid.setdefault(
+                str(metadata_entry["rowid"]), metadata_entry
+            )
 
     matched = []
     for af in audio_files:
         entry = dict(af)
-        meta = meta_by_rowid.get(af["filename"], {})
+        key = (af.get("voicemail_folder", ""), af["filename"])
+        meta = meta_by_key.get(key)
+        if meta is None:
+            # A voicemail account migration can leave audio in an A-* folder
+            # while its retained deleted-record metadata lives in the primary
+            # voicemail database. Current records above always take priority.
+            meta = cross_folder_deleted_by_rowid.get(af["filename"], {})
         entry.update(meta)
         matched.append(entry)
 
     # Also include metadata entries with no audio file (edge case)
-    audio_filenames = {af["filename"] for af in audio_files}
+    audio_keys = {
+        (af.get("voicemail_folder", ""), af["filename"])
+        for af in audio_files
+    }
     for m in metadata:
-        if str(m["rowid"]) not in audio_filenames:
+        key = (m.get("voicemail_folder", ""), str(m["rowid"]))
+        if m.get("_include_without_audio") and key not in audio_keys:
             entry = dict(m)
             entry["file_id"] = None
             entry["relative_path"] = None
@@ -369,6 +412,38 @@ def unique_output_path(path):
             return candidate
 
     raise RuntimeError(f"Could not find an available output filename for {path.name}")
+
+
+def set_file_timestamps(path, voicemail_timestamp):
+    """Set an exported file's timestamps to its voicemail time when available.
+
+    ``os.utime`` sets access and modification times on every supported platform.
+    macOS also exposes the built-in ``SetFile`` utility, which lets us set the
+    file creation time (birth time) to the same moment.
+    """
+    unix_timestamp = voicemail_unix_timestamp(voicemail_timestamp)
+    if unix_timestamp is None:
+        return
+
+    try:
+        os.utime(path, (unix_timestamp, unix_timestamp))
+    except OSError as exc:
+        print(f"Warning: could not set modification time on {path.name}: {exc}", file=sys.stderr)
+        return
+
+    if platform.system() != "Darwin" or shutil.which("SetFile") is None:
+        return
+
+    local_time = datetime.fromtimestamp(unix_timestamp).strftime("%m/%d/%Y %H:%M:%S")
+    try:
+        subprocess.run(
+            ["SetFile", "-d", local_time, "-m", local_time, str(path)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"Warning: could not set creation time on {path.name}: {exc}", file=sys.stderr)
 
 
 def convert_audio(src_path, dest_path, fmt):
@@ -445,6 +520,10 @@ def export_voicemails(matched, output_dir, backup_path, convert_format=None,
             success = extract_file(backup_path, file_id, out_path, encrypted_backup)
             entry["output_file"] = out_name if success else ""
 
+        if entry["output_file"]:
+            set_file_timestamps(
+                output_dir / entry["output_file"], entry.get("date")
+            )
         exported.append(entry)
 
     return exported
@@ -558,31 +637,65 @@ Examples:
     manifest_conn, tmp_dir, enc_backup = open_manifest_db(backup_path, args.password)
 
     try:
-        # Find voicemail files and DB
+        # Find voicemail files and every voicemail database stored in the backup.
         audio_files = find_voicemail_files(manifest_conn)
-        vm_db_file_id, vm_db_rel_path = find_voicemail_db(manifest_conn)
+        voicemail_databases = find_voicemail_databases(manifest_conn)
 
         print(f"\nFound {len(audio_files)} voicemail audio file(s)")
 
-        if not audio_files and not vm_db_file_id:
+        if not audio_files and not voicemail_databases:
             print("No voicemails found in this backup.")
             return
 
-        # Extract voicemail.db to temp for parsing
+        # Extract and parse current metadata from all account databases. The
+        # primary database's deleted table can provide metadata for audio that
+        # remains in the backup after a voicemail was deleted from the device.
         metadata = []
-        if vm_db_file_id:
+        current_metadata_count = 0
+        deleted_metadata_count = 0
+        for vm_db_file_id, vm_db_rel_path in voicemail_databases:
             with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp_db:
                 tmp_db_path = Path(tmp_db.name)
             success = extract_file(backup_path, vm_db_file_id, tmp_db_path, enc_backup)
             if success:
-                metadata = parse_voicemail_metadata(tmp_db_path)
-                print(f"Found {len(metadata)} voicemail metadata record(s)")
+                voicemail_folder = str(Path(vm_db_rel_path).parent)
+                current_metadata = parse_voicemail_metadata(
+                    tmp_db_path,
+                    voicemail_folder=voicemail_folder,
+                    include_without_audio=True,
+                )
+                metadata.extend(current_metadata)
+                current_metadata_count += len(current_metadata)
+
+                deleted_metadata = parse_voicemail_metadata(
+                    tmp_db_path,
+                    table="deleted",
+                    voicemail_folder=voicemail_folder,
+                    allow_cross_folder_match=(
+                        vm_db_rel_path == "Library/Voicemail/voicemail.db"
+                    ),
+                )
+                metadata.extend(deleted_metadata)
+                deleted_metadata_count += len(deleted_metadata)
             tmp_db_path.unlink(missing_ok=True)
+
+        if voicemail_databases:
+            print(
+                f"Found {current_metadata_count} current metadata record(s) across "
+                f"{len(voicemail_databases)} voicemail database(s)"
+            )
+            if deleted_metadata_count:
+                print(
+                    f"Found {deleted_metadata_count} deleted metadata record(s) "
+                    "for matching retained audio"
+                )
         else:
             print("Warning: voicemail.db not found — exporting audio files without metadata.")
 
         # Match audio with metadata
         matched = match_voicemails(audio_files, metadata)
+        matched_metadata_count = sum(1 for entry in matched if entry.get("rowid") is not None)
+        print(f"Matched metadata to {matched_metadata_count}/{len(audio_files)} audio file(s)")
 
         # Determine conversion format
         convert_format = None

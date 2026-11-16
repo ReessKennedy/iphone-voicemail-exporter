@@ -214,12 +214,14 @@ class TestManifestDb:
         assert "1" in filenames
         assert "2" in filenames
 
-    def test_find_voicemail_db(self, mock_backup):
+    def test_find_voicemail_databases(self, mock_backup):
         conn, _, _ = ve.open_manifest_db(mock_backup)
-        file_id, rel_path = ve.find_voicemail_db(conn)
+        databases = ve.find_voicemail_databases(conn)
         conn.close()
-        assert file_id == "ccddee003333333333333333333333333333333333"
-        assert rel_path == "Library/Voicemail/voicemail.db"
+        assert databases == [
+            ("ccddee003333333333333333333333333333333333",
+             "Library/Voicemail/voicemail.db")
+        ]
 
     def test_find_voicemail_files_empty_backup(self, tmp_dir):
         empty_db = tmp_dir / "empty_manifest.db"
@@ -253,6 +255,10 @@ class TestConvertTimestamp:
         result = ve.convert_timestamp(core_data_ts)
         assert "2024-03-15" in result
         assert "UTC" in result
+
+    def test_unix_timestamp_normalizes_core_data_epoch(self):
+        core_data_ts = 1710498120.0 - ve.CORE_DATA_EPOCH_OFFSET
+        assert ve.voicemail_unix_timestamp(core_data_ts) == 1710498120.0
 
     def test_zero_returns_empty(self):
         assert ve.convert_timestamp(0) == ""
@@ -316,6 +322,29 @@ class TestMatchVoicemails:
         matched = ve.match_voicemails(audio_files, metadata)
         assert len(matched) == 1
         assert matched[0]["file_id"] == "aaa"
+
+    def test_matches_metadata_in_its_own_voicemail_folder(self):
+        audio_files = [
+            {"file_id": "aaa", "relative_path": "Library/Voicemail/1.amr",
+             "voicemail_folder": "Library/Voicemail", "filename": "1"},
+            {"file_id": "bbb", "relative_path": "Library/Voicemail/A-account/1.amr",
+             "voicemail_folder": "Library/Voicemail/A-account", "filename": "1"},
+            {"file_id": "ccc", "relative_path": "Library/Voicemail/A-account/3.amr",
+             "voicemail_folder": "Library/Voicemail/A-account", "filename": "3"},
+        ]
+        metadata = [
+            {"rowid": 1, "sender": "+15550000001",
+             "voicemail_folder": "Library/Voicemail", "_include_without_audio": True},
+            {"rowid": 1, "sender": "+15550000002",
+             "voicemail_folder": "Library/Voicemail/A-account", "_include_without_audio": True},
+            {"rowid": 3, "sender": "+15550000003",
+             "voicemail_folder": "Library/Voicemail", "_include_without_audio": False,
+             "_allow_cross_folder_match": True},
+        ]
+        matched = ve.match_voicemails(audio_files, metadata)
+        assert [entry["sender"] for entry in matched] == [
+            "+15550000001", "+15550000002", "+15550000003"
+        ]
 
     def test_metadata_without_audio_included(self):
         audio_files = []
@@ -400,6 +429,9 @@ class TestExportVoicemails:
         assert output_dir.exists()
         exported_files = [e for e in exported if e.get("output_file")]
         assert len(exported_files) == 2
+        for entry in exported_files:
+            exported_path = output_dir / entry["output_file"]
+            assert exported_path.stat().st_mtime == pytest.approx(1710498120.0, abs=1)
 
     def test_writes_csv(self, mock_backup, tmp_dir):
         conn, _, _ = ve.open_manifest_db(mock_backup)
